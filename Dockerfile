@@ -13,6 +13,15 @@
 # Build:
 #   docker build -t strata .
 #   docker build -t strata --build-arg CUDA_ARCHITECTURES=89 .        # RTX 40 only
+#   docker build -t strata --build-arg STRATA_PORTABLE=1 .            # for another PC
+#
+# STRATA_PORTABLE=1 builds the CPU kernels for an AVX2 baseline instead of the
+# processor that builds the image (ggml's -march=native). A local build wants the
+# default, 0: it runs on the PC it was built on. A published image wants 1, because
+# the machine that builds it is not the one that runs it: a CPU with instruction
+# sets the PC lacks (AVX-512 on a CI runner, for one) would otherwise make an image
+# that stops there with an illegal instruction. The ready-made engine zips are
+# built the same way (tools/hip/build_windows.bat).
 #
 # Run (host needs an NVIDIA driver >= 580 and nvidia-container-toolkit):
 #   docker run --rm --gpus all \
@@ -58,6 +67,7 @@ COPY . .
 # refuses anything below 75. BUILD_VISION=0 skips the image encoder build.
 ARG CUDA_ARCHITECTURES=75;80;86;89;120
 ARG BUILD_VISION=1
+ARG STRATA_PORTABLE=0
 
 RUN python3 -m venv .venv \
     && .venv/bin/pip install --no-cache-dir --upgrade pip \
@@ -77,14 +87,16 @@ llama = setup.get_llama_cpp()
 nvcc, _ = setup.find_nvcc()
 arch = os.environ.get("CUDA_ARCHITECTURES", "75;80;86;89;120").strip().strip('"').replace(",", ";")
 vision = "gpu" if os.environ.get("BUILD_VISION", "1") == "1" else "none"
+portable = "ON" if os.environ.get("STRATA_PORTABLE", "0") == "1" else "OFF"   # AVX2 baseline instead of this CPU
 
 setup.cmake_build(setup.ROOT, setup.ROOT / "build", "strata",
     ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_Q6K_EXPERTS=ON", "-DSTRATA_MMQ_KQUANTS=ON", "-DSTRATA_BUILD_TESTS=OFF",
+     f"-DSTRATA_PORTABLE={portable}",
      f"-DCMAKE_CUDA_ARCHITECTURES={arch}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
      f"-DSTRATA_GGML_DIR={llama}"], None, "build-strata.bat")
 if vision != "none":
     setup.cmake_build(setup.ROOT / "tools" / "vision", setup.ROOT / "build-vision", "strata-vision",
-        [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=ON", "-DSTRATA_PORTABLE=OFF",
+        [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=ON", f"-DSTRATA_PORTABLE={portable}",
          f"-DCMAKE_CUDA_ARCHITECTURES={arch}", f"-DCMAKE_CUDA_COMPILER={nvcc}"], None, "build-vision.bat")
 
 eng = setup.ROOT / "engine"

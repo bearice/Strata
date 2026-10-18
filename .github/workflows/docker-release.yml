@@ -1,0 +1,236 @@
+# Release pipeline: builds the repository's Dockerfile and publishes the image
+# when a GitHub Release is published (and on demand, with the tag of one).
+#
+# The image is docs/INSTALL.md's "Docker (Linux)" path: the engine is compiled
+# inside the image for sm_75;80;86;89;120, so a container only downloads the model
+# on its first start. Two build arguments differ from a plain local `docker build`:
+#
+#   STRATA_PORTABLE=1   the AVX2-baseline CPU kernels. The default, 0, compiles for
+#                       the CPU that builds the image (ggml -march=native), which
+#                       is right for a build on the PC that runs it; a runner's CPU
+#                       is not that PC, and a runner with AVX-512 would otherwise
+#                       make an image that stops on a desktop with AVX2 alone.
+#   CUDA_ARCHITECTURES  the documented fat set; a manual run can narrow it to one
+#                       card (e.g. 89) for an image that is quicker to build.
+#
+# Registries: ghcr.io/<owner>/<repo>, plus Docker Hub <user>/<repo> when the
+# DOCKERHUB_USERNAME and DOCKERHUB_TOKEN secrets are set. Tags: the release
+# version (0.1.45 from v0.1.45 - the repo's tags may carry four numbers, v0.1.44.1
+# gives 0.1.44.1), sha-<short>, and latest for a stable (non-prerelease) release.
+#
+# Nothing is cached between runs on purpose: the Dockerfile copies the source tree
+# before it compiles, so a new release invalidates every layer above the OS
+# packages, and an exported cache would upload several GB to save one apt-get.
+#
+# The CUDA 13.0 devel base image alone is 3.95 GB compressed (Docker Hub, amd64,
+# 2026-10-18) and about 10 GB unpacked, and the compile writes the engine once per
+# arch. The runner the first test ran on (2026-10-18) had 145 GB on / with 86 GB
+# free, and /mnt on the same device as /, so the disk step below changed nothing
+# there: it frees the toolchains this build never uses and moves Docker's data
+# root to /mnt only when that is a different disk with 40 GB free.
+#
+# By hand: Actions -> "Release Docker image" -> Run workflow, with a tag that
+# already exists.
+name: Release Docker image
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build the image from (e.g. v0.1.45)
+        required: true
+        type: string
+      cuda_architectures:
+        description: CMAKE_CUDA_ARCHITECTURES for the engine (semicolon separated)
+        required: false
+        default: "75;80;86;89;120"
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+# One image per tag at a time: a second run waits instead of cancelling the first,
+# because a cancelled CUDA compile is an hour of runner time for nothing.
+concurrency:
+  group: docker-image-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: Build and push
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      CUDA_ARCHITECTURES: ${{ inputs.cuda_architectures || '75;80;86;89;120' }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          fetch-depth: 1
+
+      - name: Resolve the version and the image names
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          tag="${RELEASE_TAG:-${INPUT_TAG:-}}"
+          if [ -z "$tag" ]; then
+            echo "::error::no tag to build (this run has neither a release tag nor a tag input)"
+            exit 1
+          fi
+          if ! printf '%s' "$tag" | grep -Eq '^v?[0-9]+(\.[0-9]+)*(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'; then
+            echo "::error::$tag is not a version tag (vX.Y, vX.Y.Z, vX.Y.Z.W, optionally -beta.1)"
+            exit 1
+          fi
+
+          version="${tag#v}"
+          # The sha tags and labels name the commit that is built, not the tip of the
+          # ref this run was dispatched from: on a manual run those differ.
+          sha="$(git rev-parse HEAD)"
+          short_sha="$(git rev-parse --short HEAD)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE:-false}" >> "$GITHUB_OUTPUT"
+
+          # The engine version the source tree builds, as CMakeLists.txt has it and
+          # setup.py reads it: a release whose tag and source disagree ships an image
+          # whose engine names another version, so say so rather than find it later.
+          engine_version="$(sed -n 's/^project(strata VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)"
+          if [ "$engine_version" != "$version" ]; then
+            echo "::warning::CMakeLists.txt builds engine $engine_version but $tag says $version"
+          fi
+
+          # Image names must be lowercase for the registry.
+          names="ghcr.io/${GITHUB_REPOSITORY}"
+          if [ -n "${DOCKERHUB_USERNAME:-}" ] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
+            names="${names}"$'\n'"docker.io/${DOCKERHUB_USERNAME}/${GITHUB_REPOSITORY#*/}"
+          fi
+          {
+            echo "IMAGE_NAMES<<EOF"
+            printf '%s\n' "${names,,}"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "### Release Docker image"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| tag | \`$tag\` |"
+            echo "| version | \`$version\` |"
+            echo "| engine | \`$engine_version\` |"
+            echo "| commit | \`$(git rev-parse --short HEAD)\` |"
+            echo "| CUDA archs | \`$CUDA_ARCHITECTURES\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Make room for the build
+        run: |
+          set -eu
+          df -h / /mnt || true
+
+          # Toolchains this image never uses (the CUDA devel base brings its own).
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
+          sudo apt-get clean
+          sudo docker image prune -a -f || true
+
+          # The CUDA devel base is 3.95 GB compressed and about 10 GB unpacked, and the
+          # compile writes the engine once per arch. The runner the first test ran on
+          # had 86 GB free on / and /mnt on the same device, so nothing had to move;
+          # Docker's data root goes to /mnt only when that is a different disk.
+          root_dev="$(df -P /var/lib/docker | awk 'NR==2 {print $1}')"
+          mnt_dev="$(df -Pm /mnt 2>/dev/null | awk 'NR==2 {print $1}')"
+          mnt_free="$(df -Pm /mnt 2>/dev/null | awk 'NR==2 {print $4}')"
+          if [ -n "$mnt_dev" ] && [ "$mnt_dev" != "$root_dev" ] && [ "${mnt_free:-0}" -ge 40000 ]; then
+            sudo systemctl stop docker docker.socket containerd || true
+            sudo rm -rf /var/lib/docker
+            sudo mkdir -p /mnt/docker /etc/docker
+            echo '{"data-root": "/mnt/docker"}' | sudo tee /etc/docker/daemon.json > /dev/null
+            sudo systemctl start docker
+            for _ in $(seq 1 30); do sudo docker info > /dev/null 2>&1 && break; sleep 1; done
+            sudo docker info --format 'docker data root: {{.DockerRootDir}}'
+          else
+            echo "Docker's data root stays at $(sudo docker info --format '{{.DockerRootDir}}'): /mnt is the same device or has under 40 GB"
+          fi
+
+          df -h / /mnt || true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_NAMES }}
+          tags: |
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=sha-${{ steps.version.outputs.short_sha }}
+            type=raw,value=latest,enable=${{ github.event_name == 'release' && steps.version.outputs.prerelease == 'false' }}
+          labels: |
+            org.opencontainers.image.title=Strata
+            org.opencontainers.image.description=Qwen3.8-Flash-Next and its variants on one NVIDIA card
+            org.opencontainers.image.revision=${{ steps.version.outputs.sha }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          pull: true
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            CUDA_ARCHITECTURES=${{ env.CUDA_ARCHITECTURES }}
+            BUILD_VISION=1
+            STRATA_PORTABLE=1
+          provenance: true
+
+      - name: Check the pushed image
+        run: docker buildx imagetools inspect "ghcr.io/${GITHUB_REPOSITORY,,}:${{ steps.version.outputs.version }}"
+
+      - name: Summary
+        run: |
+          {
+            echo ""
+            echo "Tags:"
+            echo ""
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "Digest: \`${{ steps.build.outputs.digest }}\`"
+            echo ""
+            echo '```'
+            echo "docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -v strata-data:/data \\"
+            echo "  ghcr.io/${GITHUB_REPOSITORY,,}:${{ steps.version.outputs.version }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

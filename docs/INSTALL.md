@@ -103,6 +103,16 @@ The same idea, in a container (NVIDIA cards).
    `docker build -t strata --build-arg CUDA_ARCHITECTURES=89 .` builds for one card only (faster).
    The default covers RTX 30 (86), RTX 40 (89), RTX 50 (120) and A-series (80); a card outside that
    set needs a rebuild with its own arch. Add `--build-arg BUILD_VISION=0` to skip the image encoder.
+   A build made on one PC is compiled for that PC's processor; `--build-arg STRATA_PORTABLE=1` builds
+   the CPU kernels for an AVX2 baseline instead, which is what an image for another PC needs.
+
+   A release can also publish this image, so step 2 can be skipped:
+   `docker pull ghcr.io/<owner>/strata:<version>` - the version is the release tag without its `v`
+   (`0.1.45`), and `latest` follows the newest stable release. The workflow in
+   `.github/workflows/docker-release.yml` builds it: the same Dockerfile and the default CUDA set,
+   with `STRATA_PORTABLE=1` because a runner's processor is not the one that will run the container.
+   It is an x86-64 image, and a large pull: the CUDA 13.0 devel base image alone is 3.9 GB compressed
+   (Docker Hub, amd64, 2026-10-18), before the engine is in it.
 3. Run (the first start downloads the ~70 GB model, then starts; later starts go straight to serving):
    `docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -v strata-data:/data strata`
 
