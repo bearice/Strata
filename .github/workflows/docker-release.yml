@@ -1,33 +1,49 @@
-# Release pipeline: builds the repository's Dockerfile and publishes the image
-# when a GitHub Release is published (and on demand, with the tag of one).
+# Release pipeline: builds the repository's Dockerfile once per engine backend and
+# publishes the images when a GitHub Release is published (and on demand, with the
+# tag of one). The matrix follows the ready-made engine zips: one artifact per
+# backend, not one per GPU architecture, because the engine is a fat binary whose
+# arch list is a build argument:
 #
-# The image is docs/INSTALL.md's "Docker (Linux)" path: the engine is compiled
-# inside the image for sm_75;80;86;89;120, so a container only downloads the model
-# on its first start. Two build arguments differ from a plain local `docker build`:
+#   cuda13   ghcr.io/<owner>/<repo>:<version>          RTX 30/40/50, A-series (sm_75+)
+#   cuda12   ghcr.io/<owner>/<repo>:<version>-cuda12   Pascal sm_60, Volta sm_70, ... -
+#            the cards CUDA 13 no longer compiles for (the engine's experimental
+#            STRATA_EXPERIMENTAL_SM60 build, docs/OLDER_GPUS.md)
+#   hip      ghcr.io/<owner>/<repo>:<version>-hip      AMD Radeon gfx1100 / gfx1101 /
+#            gfx1200 / gfx1201 (docs/AMD_HIP.md)
+#
+# `latest` follows the newest stable release of the cuda13 image only; the other
+# backends are always pulled by version or by sha tag, so a user never gets an
+# image for hardware they did not ask for. Every job also tags sha-<short> with its
+# suffix (sha-abc1234-hip), naming the commit that was built.
+#
+# Two build arguments differ from a plain local `docker build`:
 #
 #   STRATA_PORTABLE=1   the AVX2-baseline CPU kernels. The default, 0, compiles for
 #                       the CPU that builds the image (ggml -march=native), which
 #                       is right for a build on the PC that runs it; a runner's CPU
 #                       is not that PC, and a runner with AVX-512 would otherwise
 #                       make an image that stops on a desktop with AVX2 alone.
-#   CUDA_ARCHITECTURES  the documented fat set; a manual run can narrow it to one
-#                       card (e.g. 89) for an image that is quicker to build.
+#   *_ARCHITECTURES     the arch list per backend: the cuda default is the
+#                       documented fat set, a manual run can narrow it to one card
+#                       (e.g. 89) for an image that is quicker to build. The HIP
+#                       list is the cards docs/AMD_HIP.md validates (gfx1100 by the
+#                       maintainers, gfx1101/gfx1200 by community reports).
 #
 # Registries: ghcr.io/<owner>/<repo>, plus Docker Hub <user>/<repo> when the
-# DOCKERHUB_USERNAME and DOCKERHUB_TOKEN secrets are set. Tags: the release
-# version (0.1.45 from v0.1.45 - the repo's tags may carry four numbers, v0.1.44.1
-# gives 0.1.44.1), sha-<short>, and latest for a stable (non-prerelease) release.
+# DOCKERHUB_USERNAME and DOCKERHUB_TOKEN secrets are set.
 #
 # Nothing is cached between runs on purpose: the Dockerfile copies the source tree
 # before it compiles, so a new release invalidates every layer above the OS
 # packages, and an exported cache would upload several GB to save one apt-get.
 #
-# The CUDA 13.0 devel base image alone is 3.95 GB compressed (Docker Hub, amd64,
-# 2026-10-18) and about 10 GB unpacked, and the compile writes the engine once per
-# arch. The runner the first test ran on (2026-10-18) had 145 GB on / with 86 GB
-# free, and /mnt on the same device as /, so the disk step below changed nothing
-# there: it frees the toolchains this build never uses and moves Docker's data
-# root to /mnt only when that is a different disk with 40 GB free.
+# The CUDA 13.0 devel base image is 3.95 GB compressed (Docker Hub, amd64,
+# 2026-10-18) and about 10 GB unpacked; the ROCm development image is 7.9 GB
+# compressed (rocm/dev-ubuntu-24.04:7.14.1-full, 2026-10-18). The compile writes
+# the engine once per arch on top. The runner the first CUDA test ran on
+# (2026-10-18) had 145 GB on / with 86 GB free, and /mnt on the same device as /,
+# so the disk step below changed nothing there: it frees the toolchains this build
+# never uses and moves Docker's data root to /mnt only when that is a different
+# disk with 40 GB free.
 #
 # By hand: Actions -> "Release Docker image" -> Run workflow, with a tag that
 # already exists.
@@ -39,32 +55,62 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to build the image from (e.g. v0.1.45)
+        description: Existing tag to build the images from (e.g. v0.1.45)
         required: true
         type: string
       cuda_architectures:
-        description: CMAKE_CUDA_ARCHITECTURES for the engine (semicolon separated)
+        description: CUDA architectures for the cuda13 image (semicolon separated)
         required: false
         default: "75;80;86;89;120"
+        type: string
+      cuda12_architectures:
+        description: CUDA architectures for the cuda12 image (below 75 for Pascal/Volta)
+        required: false
+        default: "60;61;70;75;80;86;89;90"
+        type: string
+      hip_architectures:
+        description: HIP architectures for the AMD image (semicolon separated)
+        required: false
+        default: "gfx1100;gfx1101;gfx1200;gfx1201"
         type: string
 
 permissions:
   contents: read
   packages: write
 
-# One image per tag at a time: a second run waits instead of cancelling the first,
-# because a cancelled CUDA compile is an hour of runner time for nothing.
-concurrency:
-  group: docker-image-${{ github.event.release.tag_name || inputs.tag }}
-  cancel-in-progress: false
+# No concurrency group on purpose: the matrix jobs run in parallel, and a second run
+# for the same tag (a rerun of a failed backend) is meant to build again rather than
+# wait behind the first. A cancelled CUDA compile is an hour of runner time for
+# nothing, which is why nothing cancels in progress either.
 
 jobs:
   image:
-    name: Build and push
+    name: Build and push (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    strategy:
+      fail-fast: false            # one backend failing does not leave the others unbuilt
+      matrix:
+        include:
+          - name: cuda13
+            base: nvidia/cuda:13.0.0-devel-ubuntu24.04
+            backend: cuda
+            suffix: ""
+            sm60: "OFF"
+          - name: cuda12
+            base: nvidia/cuda:12.8.1-devel-ubuntu24.04
+            backend: cuda
+            suffix: "-cuda12"
+            sm60: "ON"
+          - name: hip
+            base: rocm/dev-ubuntu-24.04:7.14.1-full
+            backend: hip
+            suffix: "-hip"
+            sm60: "OFF"
     env:
-      CUDA_ARCHITECTURES: ${{ inputs.cuda_architectures || '75;80;86;89;120' }}
+      CUDA13_ARCHITECTURES: ${{ inputs.cuda_architectures || '75;80;86;89;120' }}
+      CUDA12_ARCHITECTURES: ${{ inputs.cuda12_architectures || '60;61;70;75;80;86;89;90' }}
+      HIP_ARCHITECTURES: ${{ inputs.hip_architectures || 'gfx1100;gfx1101;gfx1200;gfx1201' }}
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:
@@ -123,15 +169,17 @@ jobs:
           } >> "$GITHUB_ENV"
 
           {
-            echo "### Release Docker image"
+            echo "### Release Docker image (${{ matrix.name }})"
             echo ""
             echo "| | |"
             echo "|---|---|"
-            echo "| tag | \`$tag\` |"
+            echo "| tag | \`$tag${{ matrix.suffix }}\` |"
             echo "| version | \`$version\` |"
+            echo "| backend | \`${{ matrix.backend }}\` |"
+            echo "| base | \`${{ matrix.base }}\` |"
             echo "| engine | \`$engine_version\` |"
             echo "| commit | \`$(git rev-parse --short HEAD)\` |"
-            echo "| CUDA archs | \`$CUDA_ARCHITECTURES\` |"
+            echo "| archs | \`${{ matrix.name == 'cuda12' && env.CUDA12_ARCHITECTURES || (matrix.name == 'hip' && env.HIP_ARCHITECTURES || env.CUDA13_ARCHITECTURES) }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Make room for the build
@@ -189,12 +237,13 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAMES }}
           tags: |
-            type=raw,value=${{ steps.version.outputs.version }}
-            type=raw,value=sha-${{ steps.version.outputs.short_sha }}
-            type=raw,value=latest,enable=${{ github.event_name == 'release' && steps.version.outputs.prerelease == 'false' }}
+            type=raw,value=${{ steps.version.outputs.version }}${{ matrix.suffix }}
+            type=raw,value=sha-${{ steps.version.outputs.short_sha }}${{ matrix.suffix }}
+            type=raw,value=latest,enable=${{ matrix.suffix == '' && github.event_name == 'release' && steps.version.outputs.prerelease == 'false' }}
           labels: |
             org.opencontainers.image.title=Strata
             org.opencontainers.image.description=Qwen3.8-Flash-Next and its variants on one NVIDIA card
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}${{ matrix.suffix }}
             org.opencontainers.image.revision=${{ steps.version.outputs.sha }}
 
       - name: Build and push
@@ -209,13 +258,17 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            CUDA_ARCHITECTURES=${{ env.CUDA_ARCHITECTURES }}
+            BASE_IMAGE=${{ matrix.base }}
+            BACKEND=${{ matrix.backend }}
+            CUDA_ARCHITECTURES=${{ matrix.name == 'cuda12' && env.CUDA12_ARCHITECTURES || env.CUDA13_ARCHITECTURES }}
+            HIP_ARCHITECTURES=${{ env.HIP_ARCHITECTURES }}
             BUILD_VISION=1
             STRATA_PORTABLE=1
+            STRATA_EXPERIMENTAL_SM60=${{ matrix.sm60 }}
           provenance: true
 
       - name: Check the pushed image
-        run: docker buildx imagetools inspect "ghcr.io/${GITHUB_REPOSITORY,,}:${{ steps.version.outputs.version }}"
+        run: docker buildx imagetools inspect "ghcr.io/${GITHUB_REPOSITORY,,}:${{ steps.version.outputs.version }}${{ matrix.suffix }}"
 
       - name: Summary
         run: |
@@ -230,7 +283,13 @@ jobs:
             echo "Digest: \`${{ steps.build.outputs.digest }}\`"
             echo ""
             echo '```'
-            echo "docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -v strata-data:/data \\"
-            echo "  ghcr.io/${GITHUB_REPOSITORY,,}:${{ steps.version.outputs.version }}"
+            if [ "${{ matrix.backend }}" = "hip" ]; then
+              echo "docker run --rm --device /dev/kfd --device /dev/dri --group-add video --group-add render \\"
+              echo "  -p 8080:8080 --ulimit memlock=-1 -v strata-data:/data \\"
+              echo "  ghcr.io/${GITHUB_REPOSITORY,,}:${{ steps.version.outputs.version }}${{ matrix.suffix }}"
+            else
+              echo "docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -v strata-data:/data \\"
+              echo "  ghcr.io/${GITHUB_REPOSITORY,,}:${{ steps.version.outputs.version }}${{ matrix.suffix }}"
+            fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

@@ -94,7 +94,8 @@ split pays only when no single card holds the model's experts ([AMD_HIP.md](AMD_
 
 ## Docker (Linux)
 
-The same idea, in a container (NVIDIA cards).
+The same idea, in a container: NVIDIA cards (CUDA 13, or CUDA 12 for cards below sm_75) and AMD
+Radeon (HIP; see [AMD Radeon](#amd-radeon) at the end of this section).
 
 1. Host: Docker with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
    and a driver **580 or newer** (CUDA 13.0).
@@ -106,13 +107,21 @@ The same idea, in a container (NVIDIA cards).
    A build made on one PC is compiled for that PC's processor; `--build-arg STRATA_PORTABLE=1` builds
    the CPU kernels for an AVX2 baseline instead, which is what an image for another PC needs.
 
-   A release can also publish this image, so step 2 can be skipped:
-   `docker pull ghcr.io/<owner>/strata:<version>` - the version is the release tag without its `v`
-   (`0.1.45`), and `latest` follows the newest stable release. The workflow in
-   `.github/workflows/docker-release.yml` builds it: the same Dockerfile and the default CUDA set,
-   with `STRATA_PORTABLE=1` because a runner's processor is not the one that will run the container.
-   It is an x86-64 image, and a large pull: the CUDA 13.0 devel base image alone is 3.9 GB compressed
-   (Docker Hub, amd64, 2026-10-18), before the engine is in it.
+   A release can also publish these images, so step 2 can be skipped. There is one image per engine
+   backend (`.github/workflows/docker-release.yml` builds them all from this Dockerfile):
+
+   | image | for |
+   |---|---|
+   | `docker pull ghcr.io/<owner>/strata:<version>` | NVIDIA, RTX 20/30/40/50 and A-series (sm_75+) |
+   | `docker pull ghcr.io/<owner>/strata:<version>-cuda12` | NVIDIA cards below sm_75 (Pascal sm_60, Volta sm_70) |
+   | `docker pull ghcr.io/<owner>/strata:<version>-hip` | AMD Radeon (gfx1100 / gfx1101 / gfx1200 / gfx1201) |
+
+   The version is the release tag without its `v` (`0.1.45`); `latest` follows the newest stable
+   release of the plain (CUDA 13) image only. Each backend also gets a `sha-<short>` tag with its
+   suffix (`sha-abc1234-hip` names the same commit's AMD image). They are x86-64 images and large
+   pulls: the CUDA 13.0 devel base image alone is 3.9 GB compressed (Docker Hub, amd64, 2026-10-18)
+   and the ROCm 7.14 development image 7.9 GB, before the engine is in them. The workflow builds with
+   `STRATA_PORTABLE=1` because a runner's processor is not the one that will run the container.
 3. Run (the first start downloads the ~70 GB model, then starts; later starts go straight to serving):
    `docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -v strata-data:/data strata`
 
@@ -151,6 +160,22 @@ The same idea, in a container (NVIDIA cards).
    Stopping: the engine releases its page-locked RAM (tens of GB) on SIGTERM, which takes longer than
    Docker's default 10 s; give it time, or `docker stop` kills it (exit 137):
    `docker run --stop-timeout 60 ...`, `docker stop -t 60 <name>`, or `stop_grace_period: 60s` in Compose.
+
+### AMD Radeon
+
+The `-hip` image is the same Dockerfile on a ROCm base: the engine is compiled for the Radeon cards
+([AMD_HIP.md](AMD_HIP.md)) and the image carries the ROCm user-space libraries, so the host needs
+only the `amdgpu` kernel driver - no ROCm install, no compiler.
+
+- Host: the `amdgpu` driver; the container gets the host's KFD and DRM device nodes. Pull
+  `ghcr.io/<owner>/strata:<version>-hip`, or build it:
+  `docker build -t strata-hip --build-arg BASE_IMAGE=rocm/dev-ubuntu-24.04:7.14.1-full --build-arg BACKEND=hip --build-arg "HIP_ARCHITECTURES=gfx1100;gfx1101;gfx1200;gfx1201" .`
+- Run:
+  `docker run --rm --device /dev/kfd --device /dev/dri --group-add video --group-add render -p 8080:8080 --ulimit memlock=-1 -v strata-data:/data strata-hip`
+  Everything else (`MODEL`, `FAMILY`, `GPU`, `GPUS`, `LOW_RAM`, `API_KEY`) works as above; `GPU` and
+  `GPUS` are HIP numbers here, the way `setup.py` lists the cards ([AMD_HIP.md](AMD_HIP.md)).
+- There is no GPU image encoder for AMD yet, so the `-hip` image carries the CPU one: `VISION=yes`
+  works, slower ([AMD_HIP.md](AMD_HIP.md)).
 
 ## Older CPUs (experimental)
 

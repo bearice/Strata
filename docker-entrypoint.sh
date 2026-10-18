@@ -3,6 +3,8 @@
 # build and lives in the image, so the first start only downloads the model.
 # The install config is kept on the /data volume so a recreated container skips
 # the setup pass and goes straight to serving.
+# BACKEND (cuda | hip) is baked into the image by docker build; setup.py is told
+# which one it is so an AMD image never compiles for, or looks for, NVIDIA.
 set -e
 cd /opt/strata || exit 1
 
@@ -16,6 +18,16 @@ if [ -r "$cpuinfo" ] && grep -q '^flags' "$cpuinfo" && ! grep -m1 '^flags' "$cpu
   echo "  engine for the CPU it runs on, and see docs/INSTALL.md (Older CPUs, experimental) for the older-CPU build." >&2
 fi
 
+# cuda | hip: the engine this image was built with (empty: let setup.py detect the card).
+BACKEND="${BACKEND:-}"
+if [ "$BACKEND" = "hip" ]; then
+  # The HIP runtime finds the card through the host's KFD; without these nodes setup.py sees no GPU and the
+  # engine cannot open one. A warning, not a stop: the container may be started just to inspect it.
+  for dev in /dev/kfd /dev/dri; do
+    [ -e "$dev" ] || echo "WARNING: $dev is not in the container: start it with --device $dev (docs/INSTALL.md, Docker on AMD)." >&2
+  done
+fi
+
 STRATA_DATA="${STRATA_DATA:-/data}"
 FAMILY="${FAMILY:-qwen}"
 MODEL="${MODEL:-IQ2_XS}"
@@ -26,7 +38,7 @@ PORT="${PORT:-8080}"
 API_KEY="${API_KEY:-}"
 KV="${KV:-}"                    # int8 | q4_0 | k8v4; empty: setup.py's own default (int8)
 GPUS="${GPUS:-}"                # "0,2" or "all": one model across several cards (docs/MULTI_GPU.md)
-GPU="${GPU:-}"                  # one card, numbered as nvidia-smi numbers them
+GPU="${GPU:-}"                  # one card: nvidia-smi's number on NVIDIA, HIP's on AMD
 LAYER_SPLIT="${LAYER_SPLIT:-}"  # with GPUS: where each later card's layers start (default: auto)
 LOW_RAM="${LOW_RAM:-auto}"      # on: the experts come from the pack's experts.bin, not from RAM
 GGUF_DIR="${GGUF_DIR:-}"        # a mounted folder with GGUF files you already have: no download
@@ -83,6 +95,7 @@ elif [ "${REINSTALL:-0}" = "1" ] || [ ! -f "$cfg" ]; then
   if [ -n "$GGUF_DIR" ]; then set -- "$@" --gguf-dir "$GGUF_DIR"; fi
   if [ -n "$RESIDENT_BUDGET_GIB" ]; then set -- "$@" --resident-budget-gib "$RESIDENT_BUDGET_GIB"; fi
   if [ -n "$KV_STREAMING" ]; then set -- "$@" --kv-streaming "$KV_STREAMING"; fi
+  if [ -n "$BACKEND" ]; then set -- "$@" --backend "$BACKEND"; fi
   .venv/bin/python setup.py --setup --yes "$@"
   [ -e "/opt/strata/strata-$tag.json" ] && { cmp -s "/opt/strata/strata-$tag.json" "$cfg" || cp -f "/opt/strata/strata-$tag.json" "$cfg"; }
   echo "Config: $cfg (from MODEL $MODEL, just set up)"
